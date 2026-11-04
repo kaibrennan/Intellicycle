@@ -1,39 +1,4 @@
-"""
-Webcam + high-resolution image barcode scanner.
 
-Controls:
-    U       Select a barcode image from your computer.
-    W       Return to webcam mode.
-    R       Reset / rescan the current source.
-    F       Request webcam autofocus.
-    Q / Esc Quit.
-
-Features:
-    - Red webcam scan box; green after a successful barcode read.
-    - Requests webcam autofocus at startup.
-    - Scans selected images at their original resolution.
-    - Looks up product information using Open Food Facts.
-    - Matches packaging against a configurable materials dictionary.
-
-Important:
-    - Autofocus requires compatible camera hardware and drivers.
-    - The red rectangle is a decoding region, not a lens-focus target.
-    - Images remain local; only the barcode is sent for product lookup.
-    - Dictionary acceptance is a prototype rule, not verified local
-      recycling eligibility.
-    - Missing or ambiguous packaging information remains Unknown.
-    - No Arduino or motor commands are sent.
-
-Install:
-    pip install opencv-python pyzbar requests pillow
-
-Additional system dependencies:
-    macOS:
-        brew install zbar
-
-    Debian / Ubuntu:
-        sudo apt-get install libzbar0 python3-tk
-"""
 
 import os
 import re
