@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import requests
 from PIL import Image, ImageOps
-
+import serial 
 
 #-------------------- macOS zbar --------------------
 
@@ -702,6 +702,16 @@ def setoutput(newval):
         json.dump(data, file, indent=1, ensure_ascii=False)
 
 
+# ----  Arduino Section ----#
+arduino = serial.Serial(port='COM4', baudrate=9600, timeout=.1) 
+
+def arduinowrite(x): 
+    arduino.write(bytes(x, 'utf-8')) 
+    time.sleep(0.05) 
+    data = arduino.readline() 
+    return data
+
+
 # -------------------- Main application --------------------
 
 def main():
@@ -876,10 +886,10 @@ def main():
                     resultoutput = -1
                     resultoutput = (
                         1 if accepted is True
-                        else 0 if accepted is False
-                        else -1
+                        else 0
                     )
                     setoutput(resultoutput)
+                    arduinowrite(str(resultoutput))
 
                     rows.extend([
                         (product["status"], GRAY),
