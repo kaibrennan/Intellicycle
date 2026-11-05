@@ -1,0 +1,29 @@
+{
+  "014800002294": {
+    "name": "Mott's Apple Juice",
+    "components": [
+      {
+        "shape": "bottle",
+        "material": "plastic"
+      }
+    ]
+  },
+  "049000047844": {
+    "name": "Fanta",
+    "components": [
+      {
+        "shape": "bottle",
+        "material": "glass"
+      }
+    ]
+  },
+  "049000004632": {
+    "name": "Coca-Cola",
+    "components": [
+      {
+        "shape": "bottle",
+        "material": "glass"
+      }
+    ]
+  }
+}
