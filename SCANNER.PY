@@ -1,5 +1,4 @@
-
-
+import json
 import os
 import re
 import textwrap
@@ -11,9 +10,47 @@ import cv2
 import numpy as np
 import requests
 from PIL import Image, ImageOps
+
+
+#-------------------- macOS zbar --------------------
+
+import ctypes.util
+import platform
+import subprocess
+from pathlib import Path
+
+def configure_macos_zbar():
+    """Help pyzbar locate Homebrew's ZBar library on macOS."""
+    if platform.system() != "Darwin":
+        return
+
+    try:
+        prefix = subprocess.check_output(
+            ["brew", "--prefix", "zbar"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return
+
+    library_path = Path(prefix) / "lib" / "libzbar.dylib"
+
+    if not library_path.exists():
+        return
+
+    original_find_library = ctypes.util.find_library
+
+    def find_library(name):
+        if name == "zbar":
+            return str(library_path)
+        return original_find_library(name)
+
+    ctypes.util.find_library = find_library
+
+
+configure_macos_zbar()
+
 from pyzbar.pyzbar import ZBarSymbol, decode
-
-
 # -------------------- Configuration --------------------
 
 CAMERA_INDEX = 0
@@ -21,30 +58,48 @@ ENABLE_LOOKUP = True
 
 CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1080
+SCAN_INTERVAL = 0.15
 
 PREVIEW_WIDTH = 1000
-PREVIEW_HEIGHT = 560
-PANEL_HEIGHT = 460
+PREVIEW_HEIGHT = 450
+PANEL_HEIGHT = 470
+WINDOW_NAME = "Packaging Barcode Scanner"
 
-WEBCAM_SCAN_INTERVAL = 0.15
-WINDOW_NAME = "Barcode Scanner"
-
-# Replace this with your contact email before using the lookup service.
 CONTACT_EMAIL = os.getenv(
     "SCANNER_CONTACT_EMAIL",
     "your-email@example.com",
 )
-USER_AGENT = f"RecyclingScannerPrototype/1.0 ({CONTACT_EMAIL})"
-
+USER_AGENT = f"PackagingScannerPrototype/1.0 ({CONTACT_EMAIL})"
 API_URL = "https://world.openfoodfacts.org/api/v2/product/{}.json"
+
+LOCAL_DATABASE_FILE = Path("local_products.json")
+
+# Project acceptance rules, NOT verified local recycling eligibility.
+ACCEPTED_TYPES = {
+    ("bottle", "plastic"): True,
+    ("can", "aluminum"): True,
+    ("bottle", "glass"): True,
+}
+
+# Optional built-in records. Enter only physically verified products.
+# A local JSON file can also provide records in the same format.
+LOCAL_PRODUCTS = {
+    # "YOUR_BARCODE": {
+    #     "name": "Verified demonstration product",
+    #     "components": [
+    #         {"shape": "bottle", "material": "plastic"},
+    #         {"shape": "cap", "material": "plastic"}
+    #     ]
+    # }
+}
 
 RED = (0, 0, 255)
 GREEN = (0, 220, 0)
 WHITE = (255, 255, 255)
-GRAY = (180, 180, 180)
+GRAY = (175, 175, 175)
 YELLOW = (0, 220, 255)
 
-BARCODE_FORMATS = [
+FORMATS = [
     ZBarSymbol.EAN13,
     ZBarSymbol.EAN8,
     ZBarSymbol.UPCA,
@@ -54,199 +109,371 @@ BARCODE_FORMATS = [
     ZBarSymbol.I25,
 ]
 
-# Prototype rules. Adjust these to match your project's requirements.
-# Classification requires BOTH a material term and a container term
-# within the same comma/semicolon-separated packaging description.
-RECYCLABLE_MATERIALS = {
-    "aluminum_can": {
-        "label": "Aluminum can",
-        "accepted": True,
-        "material_terms": ("aluminum", "aluminium"),
-        "container_terms": ("can", "cans"),
-    },
-    "plastic_bottle": {
-        "label": "Plastic bottle",
-        "accepted": True,
-        "material_terms": ("plastic", "pet", "pete"),
-        "container_terms": ("bottle", "bottles"),
-    },
+# Exact aliases: extend these after inspecting actual API responses.
+SHAPE_ALIASES = {
+    "bottle": "bottle",
+    "bottles": "bottle",
+    "can": "can",
+    "cans": "can",
+    "beverage-can": "can",
+    "jar": "jar",
+    "jars": "jar",
+    "cap": "cap",
+    "caps": "cap",
+    "lid": "lid",
+    "lids": "lid",
+    "label": "label",
+    "labels": "label",
+    "film": "film",
+    "wrapper": "wrapper",
+    "box": "box",
+    "carton": "carton",
+    "tray": "tray",
+    "bag": "bag",
+}
+
+MATERIAL_ALIASES = {
+    "plastic": "plastic",
+    "pet": "plastic",
+    "pete": "plastic",
+    "pet-polyethylene-terephthalate": "plastic",
+    "polyethylene-terephthalate": "plastic",
+    "hdpe": "plastic",
+    "hdpe-high-density-polyethylene": "plastic",
+    "ldpe": "plastic",
+    "ldpe-low-density-polyethylene": "plastic",
+    "pp": "plastic",
+    "pp-polypropylene": "plastic",
+    "polypropylene": "plastic",
+    "glass": "glass",
+    "clear-glass": "glass",
+    "green-glass": "glass",
+    "brown-glass": "glass",
+    "aluminum": "aluminum",
+    "aluminium": "aluminum",
+    "steel": "steel",
+    "paper": "paper",
+    "cardboard": "cardboard",
+}
+
+MAIN_CONTAINER_SHAPES = {
+    "bottle", "can", "jar", "box", "carton", "tray", "bag"
 }
 
 
-# -------------------- Material classification --------------------
+# -------------------- Normalization --------------------
 
-def classify_packaging(packaging):
-    """
-    Match material and container terms across the complete packaging text.
+def taxonomy_slug(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().lower()
+    return re.sub(r"^[a-z]{2}:", "", value)
 
-    This is a prototype classification based on database text.
-    It does not verify local recycling eligibility or identify which
-    packaging component each material belongs to.
-    """
-    unknown = {
-        "material": "Unknown",
-        "accepted": None,
-        "reason": "Packaging does not clearly match a configured material.",
-    }
 
-    if not isinstance(packaging, str) or not packaging.strip():
-        return {
-            **unknown,
-            "reason": "No packaging information available.",
-        }
+def normalize_shape(value):
+    return SHAPE_ALIASES.get(taxonomy_slug(value), "unknown")
 
-    # Do not split at commas: the API may list the material and
-    # container type separately, e.g. "Plastic, PET, Bottle".
-    tokens = set(re.findall(r"[a-z]+", packaging.lower()))
 
-    matches = []
+def normalize_material(value):
+    return MATERIAL_ALIASES.get(taxonomy_slug(value), "unknown")
 
-    for key, rule in RECYCLABLE_MATERIALS.items():
-        material_found = bool(
-            tokens.intersection(rule["material_terms"])
-        )
-        container_found = bool(
-            tokens.intersection(rule["container_terms"])
-        )
 
-        if material_found and container_found:
-            matches.append(key)
+def readable(value):
+    if not isinstance(value, str) or not value.strip():
+        return "Unavailable"
+    return taxonomy_slug(value).replace("-", " ")
 
-    if not matches:
-        return unknown
 
-    if len(matches) > 1:
-        return {
-            **unknown,
-            "reason": "Multiple configured packaging types found.",
-        }
+def barcode_key(barcode):
+    """Treat equivalent UPC/EAN/GTIN leading-zero forms as one local key."""
+    value = str(barcode).strip()
+    return value.zfill(14) if value.isdigit() else value
 
-    key = matches[0]
 
-    # Conservative checks: avoid accepting obvious mixed-material
-    # descriptions without knowing which component is the container.
-    conflicting_materials = {
-        "plastic_bottle": {
-            "glass", "aluminum", "aluminium", "steel",
-            "tin", "paper", "cardboard", "carton",
-        },
-        "aluminum_can": {
-            "glass", "plastic", "pet", "pete", "steel",
-            "tin", "paper", "cardboard", "carton",
-        },
-    }
+def load_local_database():
+    records = dict(LOCAL_PRODUCTS)
 
-    conflicts = tokens.intersection(
-        conflicting_materials.get(key, set())
-    )
-
-    if conflicts:
-        return {
-            **unknown,
-            "reason": (
-                "Mixed packaging materials require a manual check: "
-                + ", ".join(sorted(conflicts))
-            ),
-        }
-
-    rule = RECYCLABLE_MATERIALS[key]
+    if LOCAL_DATABASE_FILE.exists():
+        try:
+            loaded = json.loads(
+                LOCAL_DATABASE_FILE.read_text(encoding="utf-8")
+            )
+            if not isinstance(loaded, dict):
+                raise ValueError("The JSON root must be an object.")
+            records.update(loaded)
+        except (OSError, ValueError) as error:
+            print(f"Local database warning: {error}")
 
     return {
-        "material": rule["label"],
-        "accepted": rule["accepted"],
-        "reason": (
-            "Matched material and container type in packaging text; "
-        ),
+        barcode_key(code): record
+        for code, record in records.items()
+        if isinstance(record, dict)
     }
+
+
+# -------------------- Packaging classification --------------------
+
+def normalize_components(entries):
+    components = []
+
+    if not isinstance(entries, list):
+        return components
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        raw_shape = entry.get("shape")
+        raw_material = entry.get("material")
+
+        components.append({
+            "shape": normalize_shape(raw_shape),
+            "material": normalize_material(raw_material),
+            "shape_label": readable(raw_shape),
+            "material_label": readable(raw_material),
+        })
+
+    return components
+
+
+def evaluate_components(components, source):
+    """Evaluate main containers only, never caps or labels."""
+    containers = [
+        component
+        for component in components
+        if component["shape"] in MAIN_CONTAINER_SHAPES
+    ]
+
+    result = {
+        "source": source,
+        "components": components,
+        "material": "Unknown",
+        "accepted": None,
+        "reason": "Main container shape/material is not established.",
+    }
+
+    if len(containers) > 1:
+        result["reason"] = (
+            "Multiple main container components; manual check required."
+        )
+        return result
+
+    if not containers:
+        return result
+
+    container = containers[0]
+    shape = container["shape"]
+    material = container["material"]
+
+    result["material"] = (
+        f"{material.title()} {shape}"
+        if material != "unknown"
+        else f"Unknown-material {shape}"
+    )
+
+    if material == "unknown":
+        result["reason"] = "Main container material is missing or unmapped."
+        return result
+
+    decision = ACCEPTED_TYPES.get((shape, material))
+    result["accepted"] = decision
+
+    if decision is True:
+        result["reason"] = "Main container matches project acceptance rules."
+    elif decision is False:
+        result["reason"] = "Main container is not accepted by project rules."
+    else:
+        result["reason"] = "No project rule exists for this container type."
+
+    return result
+
+
+def text_components(packaging):
+    """
+    Conservative English-text fallback.
+
+    First associate shape/material within individual descriptions.
+    If only one shape and material occur in all the text, allow a
+    whole-text match such as "Plastic, PET, Bottle".
+
+    Never combine "plastic cap, glass bottle" into a plastic bottle.
+    """
+    if not isinstance(packaging, str) or not packaging.strip():
+        return []
+
+    def extract(text):
+        tokens = set(re.findall(r"[a-z]+", text.lower()))
+        shapes = {
+            SHAPE_ALIASES[token]
+            for token in tokens
+            if token in SHAPE_ALIASES
+        }
+        materials = {
+            MATERIAL_ALIASES[token]
+            for token in tokens
+            if token in MATERIAL_ALIASES
+        }
+        return shapes, materials
+
+    def make_component(shape, material):
+        return {
+            "shape": shape,
+            "material": material,
+            "shape_label": shape,
+            "material_label": material,
+        }
+
+    components = []
+
+    for description in re.split(r"[,;\n]+", packaging):
+        shapes, materials = extract(description)
+
+        if len(shapes) == 1:
+            shape = next(iter(shapes))
+            material = (
+                next(iter(materials))
+                if len(materials) == 1
+                else "unknown"
+            )
+            components.append(make_component(shape, material))
+
+    shapes, materials = extract(packaging)
+
+    # Safe only within the limits of this simple text heuristic.
+    if len(shapes) == 1 and len(materials) == 1:
+        return [
+            make_component(
+                next(iter(shapes)),
+                next(iter(materials)),
+            )
+        ]
+
+    return components
+
+
+def resolve_material(barcode, product, local_database):
+    local = local_database.get(barcode_key(barcode))
+
+    if local is not None:
+        return evaluate_components(
+            normalize_components(local.get("components")),
+            "Local verified database",
+        )
+
+    structured = normalize_components(product.get("packagings"))
+
+    if structured:
+        result = evaluate_components(
+            structured,
+            "Open Food Facts structured packaging",
+        )
+
+        # Preserve ambiguous structured records rather than overriding
+        # them with a weaker text inference.
+        if any(
+            component["shape"] in MAIN_CONTAINER_SHAPES
+            for component in structured
+        ):
+            return result
+
+    fallback = text_components(product.get("packaging"))
+
+    if fallback:
+        return evaluate_components(
+            fallback,
+            "Packaging text fallback (heuristic)",
+        )
+
+    return evaluate_components(
+        structured,
+        "Unknown / manual review",
+    )
+
 
 # -------------------- Product lookup --------------------
 
-def lookup_product(barcode):
-    """Run in a worker thread to keep the preview responsive."""
-    try:
-        response = requests.get(
-            API_URL.format(barcode),
-            params={
-                "fields": (
-                    "product_name,product_name_en,generic_name,"
-                    "brands,categories,packaging"
-                )
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=(3, 8),
-        )
-        response.raise_for_status()
-        payload = response.json()
+def lookup_product(barcode, local_database):
+    local = local_database.get(barcode_key(barcode))
+    product = {}
+    status = "Online lookup disabled."
 
-        if payload.get("status") != 1:
-            return {
-                "status": "Product not found in Open Food Facts.",
-                "recycling": classify_packaging(None),
-            }
+    if ENABLE_LOOKUP:
+        try:
+            response = requests.get(
+                API_URL.format(barcode),
+                params={
+                    "fields": (
+                        "product_name,product_name_en,generic_name,"
+                        "brands,categories,packaging,packagings"
+                    )
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=(3, 8),
+            )
+            response.raise_for_status()
+            data = response.json()
 
-        product = payload.get("product") or {}
-        packaging = product.get("packaging") or ""
+            if data.get("status") == 1:
+                candidate = data.get("product")
+                if not isinstance(candidate, dict):
+                    raise ValueError("Invalid product record.")
+                product = candidate
+                status = "Product record found."
+            else:
+                status = "Product not found online."
 
-        return {
-            "status": "Product record found.",
-            "name": (
-                product.get("product_name_en")
-                or product.get("product_name")
-                or product.get("generic_name")
-                or "Product name unavailable"
-            ),
-            "category": product.get("categories") or "Unavailable",
-            "brand": product.get("brands") or "Unavailable",
-            "packaging": packaging or "Unavailable",
-            "recycling": classify_packaging(packaging),
-        }
+        except (requests.RequestException, ValueError, AttributeError) as error:
+            status = f"Online lookup failed: {error}"
 
-    except requests.RequestException as error:
-        return {
-            "status": f"Lookup failed: {error}",
-            "recycling": classify_packaging(None),
-        }
-    except (ValueError, TypeError, AttributeError):
-        return {
-            "status": "Lookup failed: invalid API response.",
-            "recycling": classify_packaging(None),
-        }
+    name = (
+        (local or {}).get("name")
+        or product.get("product_name_en")
+        or product.get("product_name")
+        or product.get("generic_name")
+        or "Unknown product"
+    )
+
+    return {
+        "status": status,
+        "name": name,
+        "brand": product.get("brands") or "Unavailable",
+        "category": product.get("categories") or "Unavailable",
+        "packaging": product.get("packaging") or "Unavailable",
+        "recycling": resolve_material(
+            barcode, product, local_database
+        ),
+    }
 
 
-# -------------------- Barcode decoding --------------------
+# -------------------- Barcode and image scanning --------------------
 
 def decode_first(image):
-    """Return the first non-empty supported barcode."""
-    for result in decode(image, symbols=BARCODE_FORMATS):
-        value = result.data.decode("utf-8", errors="replace").strip()
-
-        if value:
-            return {
-                "barcode": value,
-                "format": result.type,
-            }
-
+    for item in decode(image, symbols=FORMATS):
+        barcode = item.data.decode("utf-8", errors="replace").strip()
+        if barcode:
+            return {"barcode": barcode, "format": item.type}
     return None
 
 
-def scan_image_file(filename):
-    """Scan the original image, then try additional processing."""
+def scan_image(filename):
+    image = None
+
     try:
         with Image.open(filename) as original:
-            upright = ImageOps.exif_transpose(original).convert("RGB")
-            rgb = np.array(upright)
+            rgb = np.array(
+                ImageOps.exif_transpose(original).convert("RGB")
+            )
 
         image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        found = decode_first(gray)
-        if found:
-            return image, found, "Barcode read from original image."
+        result = decode_first(gray)
+        if result:
+            return image, result, "Barcode read at original resolution."
 
         for scale in (0.5, 0.75, 1.5):
             if scale > 1 and max(gray.shape) > 3000:
                 continue
-
             resized = cv2.resize(
                 gray,
                 None,
@@ -256,176 +483,218 @@ def scan_image_file(filename):
                     cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
                 ),
             )
+            result = decode_first(resized)
+            if result:
+                return image, result, "Barcode read from rescaled image."
 
-            found = decode_first(resized)
-            if found:
-                return image, found, "Barcode read from rescaled image."
+        enhanced = cv2.createCLAHE(2.0, (8, 8)).apply(gray)
+        result = decode_first(enhanced)
 
-        enhanced = cv2.createCLAHE(
-            clipLimit=2.0,
-            tileGridSize=(8, 8),
-        ).apply(gray)
+        if not result:
+            _, binary = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            result = decode_first(binary)
 
-        found = decode_first(enhanced)
-        if found:
-            return image, found, "Barcode read with contrast enhancement."
-
-        _, binary = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-        )
-
-        found = decode_first(binary)
-        if found:
-            return image, found, "Barcode read with thresholding."
-
-        rotated = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
-        found = decode_first(rotated)
-
-        if found:
-            return image, found, "Barcode read after rotation."
+        if not result:
+            result = decode_first(
+                cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+            )
 
         return (
             image,
-            None,
-            "No barcode found. Try a sharp, straight-on crop with margins.",
+            result,
+            "Barcode read." if result else "No barcode found.",
         )
 
     except Exception as error:
-        return None, None, f"Could not process image: {error}"
+        return image, None, f"Image processing failed: {error}"
 
-
-# -------------------- Image selection --------------------
 
 def choose_image():
-    # Import here so webcam mode can run even without Tkinter installed.
-    import tkinter as tk
-    from tkinter import filedialog
+    """
+    Select a local image.
 
-    root = tk.Tk()
-    root.withdraw()
+    macOS:
+        Use the native file chooser through AppleScript, without Tkinter.
+
+    Windows / Linux:
+        Use Tkinter in a separate Python process.
+
+    Call this through the existing picker_worker, not directly from
+    OpenCV's main loop.
+    """
+    import json
+    import subprocess
+    import sys
+
+    if sys.platform == "darwin":
+        script = '''
+        try
+            activate
+            set selectedFile to choose file with prompt ¬
+                "Select a screenshot or barcode image"
+            return POSIX path of selectedFile
+        on error number -128
+            return ""
+        end try
+        '''
+
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                "File selection timed out. Press U to try again."
+            ) from error
+
+        if result.returncode != 0:
+            details = result.stderr.strip()
+            raise RuntimeError(
+                "macOS file picker failed: "
+                + (details or "No error details available.")
+            )
+
+        # Remove the newline printed by osascript.
+        return result.stdout.rstrip("\r\n")
+
+    # Retain a separate-process Tkinter picker for Windows / Linux.
+    picker_script = r'''
+import json
+import tkinter as tk
+from tkinter import filedialog
+
+root = tk.Tk()
+root.withdraw()
+
+try:
+    root.attributes("-topmost", True)
+    filename = filedialog.askopenfilename(
+        parent=root,
+        title="Select a screenshot or barcode image",
+        filetypes=[
+            (
+                "Image files",
+                ("*.png", "*.jpg", "*.jpeg", "*.bmp",
+                 "*.tif", "*.tiff", "*.webp")
+            ),
+            ("All files", "*"),
+        ],
+    )
+    print(json.dumps(filename), flush=True)
+finally:
+    root.destroy()
+'''
 
     try:
-        root.attributes("-topmost", True)
-
-        return filedialog.askopenfilename(
-            parent=root,
-            title="Select a high-resolution barcode image",
-            filetypes=[
-                (
-                    "Image files",
-                    "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp",
-                ),
-                ("All files", "*.*"),
-            ],
+        result = subprocess.run(
+            [sys.executable, "-c", picker_script],
+            capture_output=True,
+            text=True,
+            timeout=180,
         )
-    finally:
-        root.destroy()
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            "File selection timed out. Press U to try again."
+        ) from error
 
+    if result.returncode != 0:
+        details = result.stderr.strip()
+        raise RuntimeError(
+            "File picker failed: "
+            + (details[-1500:] if details else "No error details available.")
+        )
 
-# -------------------- Display helpers --------------------
+    output = result.stdout.strip()
+    if not output:
+        return ""
 
-def draw_text(image, text, position, color=WHITE, scale=0.58):
+    try:
+        filename = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "The file picker returned an unexpected response."
+        ) from error
+
+    if not isinstance(filename, str):
+        raise RuntimeError("The file picker did not return a file path.")
+
+    return filename
+# -------------------- Display --------------------
+
+def draw_text(image, text, position, color=WHITE):
     safe = str(text).encode("ascii", errors="replace").decode("ascii")
-
     cv2.putText(
-        image,
-        safe,
-        position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        color,
-        1,
-        cv2.LINE_AA,
+        image, safe, position,
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA,
     )
 
 
-def fit_preview(image):
-    """Resize only the display copy, preserving aspect ratio."""
+def preview_image(image):
     canvas = np.zeros(
-        (PREVIEW_HEIGHT, PREVIEW_WIDTH, 3),
-        dtype=np.uint8,
+        (PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8
     )
+
+    if image is None:
+        draw_text(
+            canvas,
+            "No image available. Press U to select a file.",
+            (30, 100),
+            YELLOW,
+        )
+        return canvas
 
     height, width = image.shape[:2]
     scale = min(PREVIEW_WIDTH / width, PREVIEW_HEIGHT / height)
-
-    new_width = max(1, round(width * scale))
-    new_height = max(1, round(height * scale))
-
     resized = cv2.resize(
         image,
-        (new_width, new_height),
-        interpolation=(
-            cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-        ),
+        (max(1, round(width * scale)), max(1, round(height * scale))),
     )
 
-    x = (PREVIEW_WIDTH - new_width) // 2
-    y = (PREVIEW_HEIGHT - new_height) // 2
-
-    canvas[y:y + new_height, x:x + new_width] = resized
+    h, w = resized.shape[:2]
+    x, y = (PREVIEW_WIDTH - w) // 2, (PREVIEW_HEIGHT - h) // 2
+    canvas[y:y + h, x:x + w] = resized
     return canvas
 
 
-def empty_preview(message):
-    canvas = np.zeros(
-        (PREVIEW_HEIGHT, PREVIEW_WIDTH, 3),
-        dtype=np.uint8,
-    )
-
-    draw_text(
-        canvas,
-        message,
-        (30, PREVIEW_HEIGHT // 2),
-        YELLOW,
-    )
-    return canvas
-
-
-def add_panel(preview, rows):
+def compose_display(preview, rows):
     panel = np.full(
-        (PANEL_HEIGHT, PREVIEW_WIDTH, 3),
-        25,
-        dtype=np.uint8,
+        (PANEL_HEIGHT, PREVIEW_WIDTH, 3), 25, dtype=np.uint8
     )
-
-    y = 26
+    y = 24
 
     for text, color in rows:
-        lines = textwrap.wrap(str(text), width=102) or [""]
-
+        lines = textwrap.wrap(str(text), width=108) or [""]
         if len(lines) > 2:
             lines = lines[:2]
-            lines[-1] = lines[-1][:98] + "..."
+            lines[-1] = lines[-1][:102] + "..."
 
         for line in lines:
-            if y > PANEL_HEIGHT - 12:
+            if y > PANEL_HEIGHT - 10:
                 return np.vstack((preview, panel))
-
-            draw_text(panel, line, (16, y), color)
-            y += 24
+            draw_text(panel, line, (14, y), color)
+            y += 22
 
     return np.vstack((preview, panel))
 
 
 def request_autofocus(camera):
     if not camera.isOpened():
-        return "Autofocus unavailable: no webcam."
-
-    accepted = camera.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-
-    if accepted:
-        return "Autofocus requested; behavior depends on camera support."
-
-    return "Camera/backend did not accept autofocus control."
+        return "No webcam; image scanning remains available."
+    if camera.set(cv2.CAP_PROP_AUTOFOCUS, 1):
+        return "Autofocus requested; hardware support required."
+    return "Camera/backend did not accept autofocus."
 
 
-# -------------------- Application --------------------
+# -------------------- Main application --------------------
 
 def main():
+    local_database = load_local_database()
     camera = cv2.VideoCapture(CAMERA_INDEX)
 
     if camera.isOpened():
@@ -433,164 +702,124 @@ def main():
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 
     autofocus_status = request_autofocus(camera)
-    print(autofocus_status)
+    image_worker = ThreadPoolExecutor(max_workers=1)
+    lookup_worker = ThreadPoolExecutor(max_workers=2)
+    picker_worker = ThreadPoolExecutor(max_workers=1)
 
-    image_executor = ThreadPoolExecutor(max_workers=1)
-    lookup_executor = ThreadPoolExecutor(max_workers=2)
+    picker_future = None
 
     image_future = None
     lookup_future = None
-    cache = {}
-
-    mode = "webcam"
-    image_path = None
     uploaded_image = None
-
-    scanned_barcode = None
-    scanned_format = None
+    image_path = None
+    scan = None
     product = None
+    mode = "webcam"
+    message = "Place the entire barcode inside the red box."
+    last_scan = 0.0
 
-    message = "Place the entire barcode inside the red rectangle."
-    last_scan_time = 0.0
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(
+        WINDOW_NAME, PREVIEW_WIDTH, PREVIEW_HEIGHT + PANEL_HEIGHT
+    )
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
-
-    def clear_scan():
-        nonlocal scanned_barcode, scanned_format, product, lookup_future
-
+    def reset_scan():
+        nonlocal scan, product, lookup_future
         if lookup_future is not None:
             lookup_future.cancel()
-
-        # A running old request may finish, but its result is discarded.
         lookup_future = None
-        scanned_barcode = None
-        scanned_format = None
+        scan = None
         product = None
 
     def accept_scan(result):
-        nonlocal scanned_barcode, scanned_format, product, lookup_future
-
-        scanned_barcode = result["barcode"]
-        scanned_format = result["format"]
-
-        print(f"\nBarcode: {scanned_barcode}")
-        print(f"Format: {scanned_format}")
-
-        if ENABLE_LOOKUP:
-            if scanned_barcode in cache:
-                product = cache[scanned_barcode]
-            else:
-                lookup_future = lookup_executor.submit(
-                    lookup_product,
-                    scanned_barcode,
-                )
+        nonlocal scan, lookup_future
+        scan = result
+        print(f"\nBarcode: {scan['barcode']} ({scan['format']})")
+        lookup_future = lookup_worker.submit(
+            lookup_product, scan["barcode"], local_database
+        )
 
     try:
         while True:
-            # Collect only the currently tracked image job.
+
+                        # Check the picker without blocking OpenCV's event loop.
+            if picker_future is not None and picker_future.done():
+                completed_picker = picker_future
+                picker_future = None
+
+                try:
+                    selected = completed_picker.result()
+                except Exception as error:
+                    message = f"File picker failed: {error}"
+                else:
+                    if selected:
+                        reset_scan()
+                        mode = "image"
+                        image_path = selected
+                        uploaded_image = None
+                        message = "Scanning original-resolution image..."
+
+                        image_future = image_worker.submit(
+                            scan_image,
+                            selected,
+                        )
+                    else:
+                        message = "Image selection cancelled."
             if image_future is not None and image_future.done():
                 uploaded_image, result, message = image_future.result()
                 image_future = None
-
                 if result:
                     accept_scan(result)
 
-            # Collect only the lookup associated with the current scan.
             if lookup_future is not None and lookup_future.done():
                 product = lookup_future.result()
                 lookup_future = None
-
-                if not product["status"].startswith("Lookup failed"):
-                    cache[scanned_barcode] = product
-
-                print(product["status"])
-
-                if "name" in product:
-                    print(f"Item: {product['name']}")
-                    print(f"Type: {product['category']}")
-                    print(f"Packaging: {product['packaging']}")
-
-                recycling = product["recycling"]
-                print(f"Material: {recycling['material']}")
-                print(f"Prototype acceptance: {recycling['accepted']}")
-                print(f"Reason: {recycling['reason']}")
+                print(json.dumps(product, indent=2, ensure_ascii=False))
 
             if mode == "webcam":
                 ok, frame = (
-                    camera.read()
-                    if camera.isOpened()
-                    else (False, None)
+                    camera.read() if camera.isOpened() else (False, None)
                 )
 
                 if ok:
-                    height, width = frame.shape[:2]
-                    box_width = int(width * 0.78)
-                    box_height = int(height * 0.35)
-
-                    x1 = (width - box_width) // 2
-                    y1 = (height - box_height) // 2
-                    x2 = x1 + box_width
-                    y2 = y1 + box_height
-
-                    now = time.monotonic()
+                    h, w = frame.shape[:2]
+                    x1, x2 = int(w * 0.11), int(w * 0.89)
+                    y1, y2 = int(h * 0.325), int(h * 0.675)
 
                     if (
-                        scanned_barcode is None
-                        and now - last_scan_time >= WEBCAM_SCAN_INTERVAL
+                        scan is None
+                        and time.monotonic() - last_scan >= SCAN_INTERVAL
                     ):
-                        last_scan_time = now
-
-                        roi = frame[y1:y2, x1:x2]
-                        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                        last_scan = time.monotonic()
+                        gray = cv2.cvtColor(
+                            frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY
+                        )
                         result = decode_first(gray)
-
                         if result:
                             accept_scan(result)
-                            message = (
-                                "Barcode read. Press R for another item."
-                            )
-
-                    color = GREEN if scanned_barcode else RED
+                            message = "Barcode read. Press R for next item."
 
                     cv2.rectangle(
-                        frame,
-                        (x1, y1),
-                        (x2, y2),
-                        color,
-                        4,
+                        frame, (x1, y1), (x2, y2),
+                        GREEN if scan else RED, 4,
                     )
-
-                    preview = fit_preview(frame)
-
+                    preview = preview_image(frame)
                 else:
-                    preview = empty_preview(
-                        "No webcam frame. Press U to select a barcode image."
-                    )
+                    preview = preview_image(None)
 
             else:
-                if uploaded_image is not None:
-                    preview = fit_preview(uploaded_image)
-                else:
-                    preview = empty_preview(
-                        "Processing image..."
-                        if image_future is not None
-                        else "Press U to select an image."
-                    )
-
-                # Image mode scans the entire original image.
-                color = GREEN if scanned_barcode else RED
-
+                preview = preview_image(uploaded_image)
                 cv2.rectangle(
                     preview,
-                    (4, 4),
-                    (PREVIEW_WIDTH - 5, PREVIEW_HEIGHT - 5),
-                    color,
-                    4,
+                    (3, 3),
+                    (PREVIEW_WIDTH - 4, PREVIEW_HEIGHT - 4),
+                    GREEN if scan else RED,
+                    3,
                 )
 
             rows = [
                 (
-                    "U: select image | W: webcam | R: reset/rescan | "
+                    "U: image | W: webcam | R: reset/rescan | "
                     "F: autofocus | Q/Esc: quit",
                     GRAY,
                 ),
@@ -598,8 +827,7 @@ def main():
                     f"Source: {mode}"
                     + (
                         f" - {Path(image_path).name}"
-                        if mode == "image" and image_path
-                        else ""
+                        if mode == "image" and image_path else ""
                     ),
                     WHITE,
                 ),
@@ -609,67 +837,68 @@ def main():
             if mode == "webcam":
                 rows.append((autofocus_status, GRAY))
 
-            if scanned_barcode:
-                rows.extend([
-                    (f"Barcode: {scanned_barcode}", GREEN),
-                    (f"Format: {scanned_format}", WHITE),
-                ])
+            if scan:
+                rows.append(
+                    (
+                        f"Barcode: {scan['barcode']} | "
+                        f"Format: {scan['format']}",
+                        GREEN,
+                    )
+                )
 
-                if not ENABLE_LOOKUP:
-                    rows.append(("Product lookup disabled.", GRAY))
-
-                elif product is None:
-                    rows.append(("Looking up product...", YELLOW))
-
+                if product is None:
+                    rows.append(("Resolving product and packaging...", YELLOW))
                 else:
-                    rows.append((product["status"], WHITE))
-
-                    if "name" in product:
-                        rows.extend([
-                            (f"Item: {product['name']}", GREEN),
-                            (f"Type: {product['category']}", WHITE),
-                            (f"Brand: {product['brand']}", WHITE),
-                            (f"Packaging: {product['packaging']}", WHITE),
-                        ])
-
                     recycling = product["recycling"]
-
-                    if recycling["accepted"] is True:
-                        acceptance_text = "Accepted by prototype rules"
-                        acceptance_color = GREEN
-
-                    elif recycling["accepted"] is False:
-                        acceptance_text = "Not accepted by prototype rules"
-                        acceptance_color = RED
-
-                    else:
-                        acceptance_text = "Unknown - manual check required"
-                        acceptance_color = YELLOW
+                    accepted = recycling["accepted"]
+                    color = (
+                        GREEN if accepted is True
+                        else RED if accepted is False
+                        else YELLOW
+                    )
+                    decision = (
+                        "Accepted by project rules" if accepted is True
+                        else "Not accepted by project rules"
+                        if accepted is False
+                        else "Unknown - manual check required"
+                    )
 
                     rows.extend([
+                        (product["status"], GRAY),
                         (
-                            f"Material: {recycling['material']}",
+                            f"Item: {product['name']} | "
+                            f"Brand: {product['brand']}",
                             WHITE,
                         ),
-                        (
-                            f"Acceptance: {acceptance_text}",
-                            acceptance_color,
-                        ),
-                        (
-                            f"Reason: {recycling['reason']}",
-                            GRAY,
-                        ),
+                        (f"Material source: {recycling['source']}", WHITE),
+                        (f"Container: {recycling['material']}", WHITE),
+                        (f"Acceptance: {decision}", color),
+                        (recycling["reason"], GRAY),
+                        ("Packaging components (shape -> material):", WHITE),
                     ])
 
-            rows.append(
-                (
-                    "Prototype rules only; local eligibility not verified. "
-                    "Motor disabled.",
-                    GRAY,
-                )
-            )
+                    components = recycling["components"]
+                    for index, component in enumerate(components[:4], 1):
+                        rows.append((
+                            f"  {index}. {component['shape_label']} -> "
+                            f"{component['material_label']}",
+                            WHITE,
+                        ))
 
-            cv2.imshow(WINDOW_NAME, add_panel(preview, rows))
+                    if not components:
+                        rows.append(("  No component information available.", GRAY))
+                    elif len(components) > 4:
+                        rows.append((
+                            f"  + {len(components) - 4} more; see terminal.",
+                            GRAY,
+                        ))
+
+            rows.append((
+                "Project rules only; local eligibility not verified. Motor disabled.",
+                GRAY,
+            ))
+
+            cv2.imshow(WINDOW_NAME, compose_display(preview, rows))
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord("q"), ord("Q"), 27):
@@ -677,68 +906,52 @@ def main():
 
             if key in (ord("f"), ord("F")):
                 autofocus_status = request_autofocus(camera)
-                print(autofocus_status)
 
             elif key in (ord("u"), ord("U")):
+                if picker_future is not None:
+                    message = "Image picker is already open."
+                    continue
+
                 if image_future is not None:
-                    message = "Image processing in progress; please wait."
+                    message = "Image scan in progress; please wait."
                     continue
 
-                try:
-                    selected = choose_image()
-                except Exception as error:
-                    message = f"Could not open file picker: {error}"
-                    continue
+                message = "Select an image in the file picker..."
+                picker_future = picker_worker.submit(choose_image)
 
-                if selected:
-                    clear_scan()
-                    mode = "image"
-                    image_path = selected
-                    uploaded_image = None
-                    message = "Scanning original-resolution image..."
-
-                    image_future = image_executor.submit(
-                        scan_image_file,
-                        image_path,
-                    )
 
             elif key in (ord("w"), ord("W")):
                 if image_future is not None:
                     image_future.cancel()
                     image_future = None
 
-                clear_scan()
+                reset_scan()
                 mode = "webcam"
-                message = (
-                    "Place the entire barcode inside the red rectangle."
-                )
+                message = "Place the entire barcode inside the red box."
                 autofocus_status = request_autofocus(camera)
 
             elif key in (ord("r"), ord("R")):
                 if image_future is not None:
-                    message = "Image processing in progress; please wait."
+                    message = "Image scan in progress; please wait."
                     continue
 
-                clear_scan()
+                # Reload local records so edits take effect on rescan.
+                local_database = load_local_database()
+                reset_scan()
 
                 if mode == "image" and image_path:
-                    message = "Rescanning original-resolution image..."
-
-                    image_future = image_executor.submit(
-                        scan_image_file,
-                        image_path,
-                    )
+                    message = "Rescanning image..."
+                    image_future = image_worker.submit(scan_image, image_path)
                 else:
-                    message = (
-                        "Place the entire barcode inside the red rectangle."
-                    )
+                    message = "Place the entire barcode inside the red box."
 
     finally:
         camera.release()
         cv2.destroyAllWindows()
+        image_worker.shutdown(wait=False, cancel_futures=True)
+        lookup_worker.shutdown(wait=False, cancel_futures=True)
 
-        image_executor.shutdown(wait=False, cancel_futures=True)
-        lookup_executor.shutdown(wait=False, cancel_futures=True)
+        picker_worker.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
