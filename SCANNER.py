@@ -702,8 +702,8 @@ def setoutput(newval):
         json.dump(data, file, indent=1, ensure_ascii=False)
 
 
-# ----  Arduino Section ----#
-arduino = serial.Serial(port='COM4', baudrate=9600, timeout=.1) 
+# ----  Arduino Section ----# #using Ben's port
+arduino = serial.Serial(port='/dev/cu.usbmodem14101', baudrate=9600, timeout=.1) 
 
 def arduinowrite(x): 
     arduino.write(bytes(x, 'utf-8')) 
