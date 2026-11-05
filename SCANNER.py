@@ -691,6 +691,17 @@ def request_autofocus(camera):
     return "Camera/backend did not accept autofocus."
 
 
+# -------------------- Update public facing output for raspi ---------------_#
+def setoutput(newval):
+    with open("results.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    data["Output"] = newval
+
+    with open("results.json", "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=1, ensure_ascii=False)
+
+
 # -------------------- Main application --------------------
 
 def main():
@@ -862,6 +873,13 @@ def main():
                         if accepted is False
                         else "Unknown - manual check required"
                     )
+                    resultoutput = -1
+                    resultoutput = (
+                        1 if accepted is True
+                        else 0 if accepted is False
+                        else -1
+                    )
+                    setoutput(resultoutput)
 
                     rows.extend([
                         (product["status"], GRAY),
