@@ -26,4 +26,13 @@
       }
     ]
   }
+  "02113033459": {
+    "name": "Soleil",
+    "components": [
+      {
+        "shape": "can",
+        "material": "aluminum"
+      }
+    ]
+  }
 }
